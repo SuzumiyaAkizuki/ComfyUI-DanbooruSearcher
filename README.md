@@ -1,19 +1,23 @@
 # ComfyUI-DanbooruSearcher
+
+![](https://akizukipic.oss-cn-beijing.aliyuncs.com/img/202602100945958.png)
+
 本项目提供一种模糊查找 Danbooru 标签的方法。用户可以凭借模糊的语言描述，查找 Danbooru 数据集中对应的标签。
 
 在线试用链接：[在线试用](https://huggingface.co/spaces/SAkizuki/DanbooruSearch)
 
-[toc]
-
-
 
 ## 节点说明
+
+本节点利用预训练的向量模型将用户输入的自然语言描述映射到高维向量空间，并与标签向量库进行相似度匹配，最终结合标签热度进行混合排序推荐。
 
 ![image-20260209214519225](https://akizukipic.oss-cn-beijing.aliyuncs.com/img/202602092145168.png)
 
 本节点需要5个输入参数：
 
-- `model_path`：保存嵌入模型的路径。推荐使用BGE-M3模型。其在HuggingFace上的标识为`BAAI/bge-m3`，下载地址为[BGE-M3](https://huggingface.co/BAAI/bge-m3/tree/main)。例如，如果文件夹结构为
+- `model_path`：保存向量模型的路径。推荐使用BGE-M3模型。其在HuggingFace上的标识为`BAAI/bge-m3`，下载地址为[BGE-M3](https://huggingface.co/BAAI/bge-m3/tree/main)。
+
+  例如，如果文件夹结构为
 
   ```powershell
   PS D:\Produce\StableDiffusion\test-coding\my_model_bge_m3> tree /F
@@ -360,3 +364,4 @@ night_clothes                | 0.621  | 0.676  | 裙子         | 睡衣
 然后，把这个子图输出的字符串连接到LLM XML Prompt Formatter的输入上
 
 ![image-20260209220730424](https://akizukipic.oss-cn-beijing.aliyuncs.com/img/202602092207684.png)
+
