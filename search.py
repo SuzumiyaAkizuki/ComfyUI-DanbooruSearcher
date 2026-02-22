@@ -5,6 +5,7 @@ import os
 import pickle
 import jieba
 import numpy as np
+import re
 import time
 
 
@@ -27,14 +28,21 @@ class DanbooruTagger:
 
         self.cache_path = cache_path
         self.csv_path = csv_path
-        self.model_path = model_path
+        self.model_path = model_path if model_path else 'BAAI/bge-m3'
 
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.model = None
         self.df = None
-        self.emb_cn = None
+
+        # 四层索引
         self.emb_en = None
+        self.emb_cn = None
+        self.emb_wiki = None
+        self.emb_cn_core = None
+
         self.max_log_count = 15.0
 
+        # 停用词表
         self.stop_words = {
             ',', '.', ':', ';', '?', '!', '"', "'", '`',
             '(', ')', '[', ']', '{', '}', '<', '>',
@@ -61,162 +69,168 @@ class DanbooruTagger:
         self.initialized = True
 
     def _load(self):
-        t0 = time.time()
+        # 自动调整缓存路径以匹配设备
+        base, ext = os.path.splitext(self.cache_path)
+        real_cache = f"{base}_{self.device}_fp16{ext}"
 
-        # 1. 如果没有缓存，则触发自动构建
-        if not os.path.exists(self.cache_path):
-            print("\n" + "=" * 50)
-            print("[DTOOL]: 正在首次构建向量索引库，这可能需要 1~3 分钟...")
-            print("[DTOOL]: (此过程只会在第一次运行时执行一次)")
-            self._build_from_csv()
+        if not os.path.exists(real_cache):
+            print(f"[DanbooruSearch] Cache not found. Building from CSV: {self.csv_path}")
+            self._build_from_csv(real_cache)
         else:
-            print(f"[DTOOL]: 正在从 {self.cache_path} 读取索引...")
-            with open(self.cache_path, 'rb') as f:
-                data = pickle.load(f)
-                self.df = data['df']
-                self.emb_cn = data['embeddings_cn']
-                self.emb_en = data['embeddings_en']
-                self.max_log_count = data.get('max_log_count', 15.0)
+            print(f"[DanbooruSearch] Loading cache: {real_cache}")
+            try:
+                with open(real_cache, 'rb') as f:
+                    data = pickle.load(f)
+                    self.df = data['df']
+                    self.emb_en = data['embeddings_en'].float()
+                    self.emb_cn = data['embeddings_cn'].float()
+                    self.emb_wiki = data.get('embeddings_wiki', torch.zeros_like(self.emb_en)).float()
+                    self.emb_cn_core = data.get('embeddings_cn_core', torch.zeros_like(self.emb_en)).float()
+                    self.max_log_count = data.get('max_log_count', 15.0)
+            except Exception as e:
+                print(f"[DanbooruSearch] Cache load failed ({e}), rebuilding...")
+                self._build_from_csv(real_cache)
 
-        # 2. 确保模型已被加载 (如果从缓存读取，模型还是None，需要在这里加载)
         if self.model is None:
-            print(f"DTOOL: Loading Model from {self.model_path}...")
-            if not os.path.exists(self.model_path):
-                raise FileNotFoundError(f"Missing Model Folder: {self.model_path}")
-            device = 'cuda' if torch.cuda.is_available() else 'cpu'
-            self.model = SentenceTransformer(self.model_path, device=device)
+            print(f"[DanbooruSearch] Loading Model: {self.model_path}")
+            self.model = SentenceTransformer(self.model_path, device=self.device)
 
-        # 3. 初始化 Jieba
-        print("DTOOL: Building Jieba Dict from memory...")
-        self._setup_jieba_from_memory()
+        # 内存构建 Jieba 字典
+        print("[DanbooruSearch] Building Jieba dict...")
+        if self.df is not None and 'cn_name' in self.df.columns:
+            all_text = self.df['cn_name'].dropna().astype(str)
+            for text in all_text:
+                parts = text.replace(',', ' ').split()
+                for part in parts:
+                    if len(part) > 1: jieba.add_word(part.strip(), 2000)
 
-        print(f"DTOOL: Initialization finished in {time.time() - t0:.2f}s")
+    def _read_csv_robust(self, path):
+        encodings = ['utf-8', 'gbk', 'gb18030']
+        for enc in encodings:
+            try:
+                return pd.read_csv(path, dtype=str, encoding=enc).fillna("")
+            except UnicodeDecodeError:
+                continue
+            except Exception as e:
+                print(f"[DanbooruSearch] CSV Error ({enc}): {e}")
+                break
+        raise ValueError(f"无法读取 CSV 文件: {path}，请检查文件是否存在或编码格式。")
 
-    def _build_from_csv(self):
-        """
-        从 CSV 读取数据并使用 GPU/CPU 生成向量库
-        """
-        if not os.path.exists(self.csv_path):
-            raise FileNotFoundError(f"Missing Source File: {self.csv_path}\nPlease provide tags.csv!")
+    def _build_from_csv(self, save_path):
+        df = self._read_csv_robust(self.csv_path)
 
-        print(f"DTOOL: Reading {self.csv_path} ...")
-        try:
-            df = pd.read_csv(self.csv_path, encoding='utf-8', dtype=str)
-        except:
-            df = pd.read_csv(self.csv_path, encoding='gbk', dtype=str)
-
-        # 数据清洗
-        df.dropna(subset=['name'], inplace=True)
-        df = df[df['name'].str.strip() != '']
-        if 'cn_name' not in df.columns: df['cn_name'] = ''
-        df['cn_name'] = df['cn_name'].fillna('')
         if 'post_count' not in df.columns: df['post_count'] = 0
         df['post_count'] = pd.to_numeric(df['post_count'], errors='coerce').fillna(0)
 
-        self.df = df
-        self.max_log_count = np.log1p(df['post_count'].max())
+        if 'cn_name' not in df.columns: df['cn_name'] = ""
+        if 'wiki' not in df.columns: df['wiki'] = ""
+        if 'name' not in df.columns:
+            raise ValueError("CSV missing 'name' column")
 
-        # 加载模型用于编码
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        print(f"DTOOL: Loading Model for encoding (Device: {device})...")
-        self.model = SentenceTransformer(self.model_path, device=device)
+        df['cn_core'] = df['cn_name'].str.split(',', n=1).str[0].str.strip()
 
-        # 编码中文层
-        print("DTOOL: Encoding Chinese tags...")
-        cn_sentences = df['cn_name'].apply(lambda x: x if len(str(x).strip()) > 0 else "UNK").tolist()
-        self.emb_cn = self.model.encode(cn_sentences, batch_size=64, show_progress_bar=True, convert_to_tensor=True)
+        print("[DanbooruSearch] Encoding embeddings (this may take a while)...")
+        if self.model is None:
+            self.model = SentenceTransformer(self.model_path, device=self.device)
 
-        # 编码英文层
-        print("DTOOL: Encoding English tags...")
-        en_sentences = df['name'].tolist()
-        self.emb_en = self.model.encode(en_sentences, batch_size=64, show_progress_bar=True, convert_to_tensor=True)
+        self.emb_en = self.model.encode(df['name'].tolist(), batch_size=64, show_progress_bar=True,
+                                        convert_to_tensor=True).float()
+        self.emb_cn = self.model.encode(df['cn_name'].tolist(), batch_size=64, show_progress_bar=True,
+                                        convert_to_tensor=True).float()
+        self.emb_wiki = self.model.encode(df['wiki'].tolist(), batch_size=64, show_progress_bar=True,
+                                          convert_to_tensor=True).float()
+        self.emb_cn_core = self.model.encode(df['cn_core'].tolist(), batch_size=64, show_progress_bar=True,
+                                             convert_to_tensor=True).float()
 
-        # 保存到 pkl
-        print("DTOOL: Saving cache to disk...")
         cache_data = {
             'df': df,
-            'embeddings_cn': self.emb_cn,
-            'embeddings_en': self.emb_en,
-            'max_log_count': self.max_log_count
+            'embeddings_en': self.emb_en.half(),
+            'embeddings_cn': self.emb_cn.half(),
+            'embeddings_wiki': self.emb_wiki.half(),
+            'embeddings_cn_core': self.emb_cn_core.half(),
+            'max_log_count': np.log1p(df['post_count'].max())
         }
-        with open(self.cache_path, 'wb') as f:
-            pickle.dump(cache_data, f)
-        print("DTOOL: Cache built successfully!")
 
-    def _setup_jieba_from_memory(self):
-        if self.df is not None:
-            cn_tags = self.df['cn_name'].dropna().astype(str).tolist()
-            count = 0
-            for tag in cn_tags:
-                tag = tag.strip()
-                if len(tag) > 1:
-                    jieba.add_word(tag, 2000)
-                    count += 1
-            print(f"DTOOL: Added {count} words to Jieba from data.")
+        with open(save_path, 'wb') as f:
+            pickle.dump(cache_data, f)
+
+        self.df = df
+        print("[DanbooruSearch] Cache built successfully.")
+
+    def _smart_split(self, text):
+        tokens = []
+        chunks = re.split(r'([\u4e00-\u9fa5]+)', text)
+        for chunk in chunks:
+            if not chunk.strip(): continue
+            if re.match(r'[\u4e00-\u9fa5]+', chunk):
+                tokens.extend(jieba.cut(chunk))
+            else:
+                parts = re.sub(r'[,()\[\]{}:]', ' ', chunk).split()
+                tokens.extend([p for p in parts if not p.isdigit()])
+        return tokens
 
     def search(self, user_query, top_k=5, limit=80, popularity_weight=0.15):
-        seg_list = list(jieba.cut(user_query))
-        keywords = [w.strip() for w in seg_list if w.strip() and w.strip() not in self.stop_words]
-        search_queries = [user_query] + keywords
+        if self.df is None:
+            return "", "Error: Database not loaded."
 
-        query_embeddings = self.model.encode(search_queries, convert_to_tensor=True)
+        # 构建查询序列
+        keywords = self._smart_split(user_query)
+        search_queries = [user_query] + [w for w in keywords if w not in self.stop_words]
 
-        hits_cn = util.semantic_search(query_embeddings, self.emb_cn, top_k=top_k)
+        # 编码查询
+        query_embeddings = self.model.encode(search_queries, convert_to_tensor=True).float()
+
+        # 多层检索
         hits_en = util.semantic_search(query_embeddings, self.emb_en, top_k=top_k)
+        hits_cn = util.semantic_search(query_embeddings, self.emb_cn, top_k=top_k)
+        hits_wiki = util.semantic_search(query_embeddings, self.emb_wiki, top_k=top_k)
+        hits_cn_core = util.semantic_search(query_embeddings, self.emb_cn_core, top_k=top_k)
 
         final_results = {}
-
         for i, _ in enumerate(search_queries):
             source_word = search_queries[i]
-            combined = []
-            for h in hits_cn[i]: combined.append((h, 'CN'))
-            for h in hits_en[i]: combined.append((h, 'EN'))
+            # 标记来源层
+            combined = [(h, 'EN') for h in hits_en[i]] + [(h, 'CN') for h in hits_cn[i]] + \
+                       [(h, 'Wiki') for h in hits_wiki[i]] + [(h, 'Core') for h in hits_cn_core[i]]
 
             for hit, layer in combined:
-                score = hit['score']
-                if score < 0.35: continue
-
                 idx = hit['corpus_id']
+                score = hit['score']
                 row = self.df.iloc[idx]
                 tag_name = row['name']
-                count = row['post_count']
 
-                log_count = np.log1p(count)
-                pop_score = log_count / self.max_log_count
+                pop_score = np.log1p(float(row['post_count'])) / self.max_log_count
                 final_score = (score * (1 - popularity_weight)) + (pop_score * popularity_weight)
 
                 if tag_name not in final_results or final_score > final_results[tag_name]['final_score']:
                     final_results[tag_name] = {
+                        'tag': tag_name,
                         'final_score': final_score,
-                        'semantic_score': score,
+                        'semantic_score': score,  # 保留语义分
+                        'source': source_word,  # 保留匹配来源词
                         'cn_name': row['cn_name'],
-                        'count': int(count),
-                        'source': source_word,
                         'layer': layer
                     }
 
-        sorted_tags = sorted(final_results.items(), key=lambda x: x[1]['final_score'], reverse=True)
-        valid_tags = [item for item in sorted_tags if item[1]['final_score'] > 0.45]
+        sorted_tags = sorted(final_results.values(), key=lambda x: x['final_score'], reverse=True)[:limit]
+        tags_string = ", ".join([item['tag'] for item in sorted_tags])
 
+        # 生成原始格式的 Debug 表格
         debug_lines = []
         debug_lines.append(f"{'匹配标签':<25} | {'综合分':<6} | {'语义分':<6} | {'来源':<8} | {'中文含义'}")
         debug_lines.append("-" * 100)
 
-        if len(valid_tags) > limit:
-            debug_lines.append(f"[提示] 结果过多 ({len(valid_tags)}个)，已截取前 {limit} 个。")
-            valid_tags = valid_tags[:limit]
-
-        output_tags = []
-        for tag, info in valid_tags:
-            score_str = f"{info['final_score']:.3f}"
+        for item in sorted_tags:
+            score_str = f"{item['final_score']:.3f}"
+            sem_str = f"{item['semantic_score']:.3f}"
+            source_str = str(item['source'])[:8]  # 截断一下避免太长
             debug_lines.append(
-                f"{tag:<28} | {score_str:<6} | {info['semantic_score']:.3f}  | {info['source']:<10} | {info['cn_name']}")
-            output_tags.append(tag)
+                f"{item['tag']:<28} | {score_str:<6} | {sem_str:<6}  | {source_str:<10} | {item['cn_name']}"
+            )
 
-        return ", ".join(output_tags), "\n".join(debug_lines)
+        return tags_string, "\n".join(debug_lines)
 
 
-# ================= ComfyUI 节点类 =================
 
 class DanbooruTagSearch:
     def __init__(self):
@@ -226,7 +240,7 @@ class DanbooruTagSearch:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "model_path":("STRING",{"multiline":False}),
+                "model_path": ("STRING", {"multiline": False, "default": ""}),
                 "top_k": ("INT", {"default": 5, "min": 1, "max": 50, "step": 1}),
                 "limit": ("INT", {"default": 80, "min": 10, "max": 300, "step": 10}),
                 "popularity_weight": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.05}),
@@ -239,24 +253,17 @@ class DanbooruTagSearch:
     FUNCTION = "search"
     CATEGORY = "utils/prompt"
 
-    def search(self, text,model_path, top_k, limit, popularity_weight):
-        # 1. 确定资源路径
+    def search(self, text, model_path, top_k, limit, popularity_weight):
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        csv_file = os.path.join(current_dir, "tags.csv")  # [新增] 传入 CSV 路径
-        cache_file = os.path.join(current_dir, "danbooru_vectors_dual.pkl")
-        model_dir = model_path
+        csv_file = os.path.join(current_dir, "tags_enhanced.csv")
+        if not os.path.exists(csv_file): csv_file = os.path.join(current_dir, "tags.csv")
 
-        # 2. 初始化单例
+        cache_file = os.path.join(current_dir, "danbooru_vectors_multiview.pkl")
+
         tagger = DanbooruTagger()
+        tagger.init_engine(model_path, cache_file, csv_file)
 
-        if not tagger.initialized:
-            print(f"DTOOL: Initializing Danbooru Tagger...")
-            tagger.init_engine(model_dir, cache_file, csv_file)  # [修改] 传递 3 个参数
-
-        # 3. 执行搜索
-        tags, info = tagger.search(text, top_k, limit, popularity_weight)
-
-        print(f"\n[Danbooru Search] Input: {text}")
-        print(info)
-
+        tags, info = tagger.search(
+            user_query=text, top_k=top_k, limit=limit, popularity_weight=popularity_weight
+        )
         return (tags, info)
