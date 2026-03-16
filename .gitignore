@@ -1,1 +1,4 @@
 *.pkl
+.idea/
+*.pyc
+tags_embedding/

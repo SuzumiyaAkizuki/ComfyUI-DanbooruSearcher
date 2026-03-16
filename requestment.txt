@@ -2,3 +2,5 @@ pandas
 sentence-transformers
 jieba
 numpy
+pyarrow
+safetensors
