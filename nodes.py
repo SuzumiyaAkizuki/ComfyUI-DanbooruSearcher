@@ -1,11 +1,10 @@
 """
 nodes.py
-────────
-ComfyUI 节点定义。
+ComfyUI node definitions.
 
-节点列表：
-  DanbooruTagSearch   语义搜索，输出候选标签池
-  DanbooruRelated     共现推荐，基于搜索结果扩充候选池，供 LLM 做最终筛选
+Nodes:
+  DanbooruTagSearch   semantic search, outputs a candidate tag pool
+  DanbooruRelated     co-occurrence recommendation, expands the pool for LLM filtering
 """
 
 from __future__ import annotations
@@ -14,7 +13,6 @@ import os
 import sys
 import asyncio
 
-# 把插件目录加入 sys.path，确保 core/ 可以被找到
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
@@ -24,8 +22,7 @@ from core.models import SearchRequest
 
 
 def _get_tagger(model_path: str | None) -> DanbooruTagger:
-    """同步获取引擎单例，兼容 asyncio 环境。"""
-    # 数据文件路径全部用绝对路径，避免受 ComfyUI 工作目录影响
+    """Synchronously obtain the engine singleton, compatible with asyncio environments."""
     kwargs = {
         "csv_file":  os.path.join(_HERE, "origin_database", "tags_enhanced.csv"),
         "cooc_file": os.path.join(_HERE, "origin_database", "cooccurrence_clean.parquet"),
@@ -50,14 +47,10 @@ def _get_tagger(model_path: str | None) -> DanbooruTagger:
         return asyncio.run(_get())
 
 
-# ══════════════════════════════════════════════════════════════════════
-# 节点 1：语义搜索
-# ══════════════════════════════════════════════════════════════════════
-
 class DanbooruTagSearch:
     """
-    语义搜索节点。
-    输入自然语言描述，返回匹配的 Danbooru 标签候选池。
+    Semantic search node.
+    Accepts a natural language description and returns a matched Danbooru tag pool.
     """
 
     @classmethod
@@ -71,23 +64,23 @@ class DanbooruTagSearch:
                 "model_path": ("STRING", {
                     "multiline": False,
                     "default": "",
-                    "tooltip": "BGE-M3 本地路径，留空则自动从 HuggingFace 下载（BAAI/bge-m3）",
+                    "tooltip": "BGE-M3 local path; leave empty to auto-download from HuggingFace (BAAI/bge-m3)",
                 }),
                 "top_k": ("INT", {
                     "default": 5, "min": 1, "max": 50, "step": 1,
-                    "tooltip": "每个分词各取前 top_k 个候选标签",
+                    "tooltip": "Top-k candidates retrieved per segment per vector layer",
                 }),
                 "limit": ("INT", {
                     "default": 80, "min": 10, "max": 300, "step": 10,
-                    "tooltip": "最终输出的标签数量上限",
+                    "tooltip": "Maximum number of tags in the final output",
                 }),
                 "popularity_weight": ("FLOAT", {
                     "default": 0.15, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "热度在综合得分中的权重，推荐 0.15",
+                    "tooltip": "Weight of post-count popularity in the composite score; 0.15 recommended",
                 }),
                 "use_segmentation": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "开启后对输入分词后分别检索，适合完整句子；关闭后整句检索，适合精准查找",
+                    "tooltip": "Enable to segment input and search each concept separately (full scene); disable for exact/single-phrase lookup",
                 }),
                 "show_nsfw": ("BOOLEAN", {
                     "default": True,
@@ -103,7 +96,6 @@ class DanbooruTagSearch:
     def search(self, text, model_path, top_k, limit, popularity_weight,
                use_segmentation, show_nsfw):
 
-        # 设置本地模型路径（engine 会自动处理空字符串）
         if model_path.strip():
             os.environ["DANBOORU_MODEL_PATH"] = model_path.strip()
 
@@ -119,9 +111,14 @@ class DanbooruTagSearch:
         )
         response = tagger.search(request)
 
-        # debug_info 表格
-        lines = [
-            f"{'标签':<28} {'综合分':<7} {'语义分':<7} {'来源':<12} 中文含义",
+        lines = []
+
+        if response.keywords:
+            lines.append(f"segmentation keywords: {', '.join(response.keywords)}")
+            lines.append("")
+
+        lines += [
+            f"{'tag':<28} {'score':<7} {'sem':<7} {'source':<12} cn_name",
             "-" * 80,
         ]
         for r in response.results:
@@ -130,24 +127,23 @@ class DanbooruTagSearch:
                 f" {str(r.source)[:10]:<12} {r.cn_name}"
             )
 
-        return (response, response.tags_sfw if not show_nsfw else response.tags_all,
-                "\n".join(lines))
+        return (
+            response,
+            response.tags_sfw if not show_nsfw else response.tags_all,
+            "\n".join(lines),
+        )
 
-
-# ══════════════════════════════════════════════════════════════════════
-# 节点 2：共现推荐
-# ══════════════════════════════════════════════════════════════════════
 
 class DanbooruRelated:
     """
-    共现推荐节点（RAG 扩充用）。
+    Co-occurrence recommendation node (RAG expansion).
 
-    以搜索结果中「每个分词的 top1 标签」作为种子，
-    从共现表查找关联标签，扩充候选池后一并传给 LLM 做最终筛选。
+    Uses the top-1 tag per segment from the search result as seeds,
+    queries the co-occurrence table for related tags, and merges them
+    into a combined pool for downstream LLM filtering.
 
-    推荐接在 DanbooruTagSearch 之后使用：
-      DanbooruTagSearch → search_result → DanbooruRelated
-                                        → combined_tags → LLM
+    Typical pipeline:
+      DanbooruTagSearch -> search_result -> DanbooruRelated -> combined_tags -> LLM
     """
 
     @classmethod
@@ -157,7 +153,7 @@ class DanbooruRelated:
                 "search_result": ("DANBOORU_RESULT",),
                 "limit": ("INT", {
                     "default": 50, "min": 10, "max": 200, "step": 10,
-                    "tooltip": "共现推荐的标签数量上限",
+                    "tooltip": "Maximum number of co-occurrence recommendations",
                 }),
                 "show_nsfw": ("BOOLEAN", {
                     "default": True,
@@ -173,7 +169,7 @@ class DanbooruRelated:
     def related(self, search_result, limit, show_nsfw):
         tagger = _get_tagger(None)
 
-        # ── 每个分词取 final_score 最高的一条作为种子 ──────────────────
+        # Pick the highest-scoring tag per source segment as the seed.
         seeds: dict[str, object] = {}
         for r in search_result.results:
             src = r.source
@@ -182,10 +178,9 @@ class DanbooruRelated:
 
         seed_tags = [r.tag for r in seeds.values()]
 
-        # ── 已选标签集合（种子 + 搜索结果全集，避免推荐重复内容）──────
+        # Exclude all tags already present in the search result to avoid duplicates.
         existing = {r.tag for r in search_result.results}
 
-        # ── 共现推荐 ──────────────────────────────────────────────────
         related = tagger.get_related(
             seed_tags=seed_tags,
             exclude=existing,
@@ -195,7 +190,6 @@ class DanbooruRelated:
 
         related_str = ", ".join(r.tag for r in related)
 
-        # combined = 搜索结果 + 推荐，去重，保持顺序
         search_tags = (search_result.tags_sfw if not show_nsfw
                        else search_result.tags_all)
         seen = set()
@@ -206,6 +200,4 @@ class DanbooruRelated:
                 seen.add(tag)
                 combined_list.append(tag)
 
-        combined_str = ", ".join(combined_list)
-
-        return (related_str, combined_str)
+        return (related_str, ", ".join(combined_list))

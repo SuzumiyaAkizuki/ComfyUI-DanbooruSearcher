@@ -1,21 +1,21 @@
 """
 core/engine.py
-──────────────
-DanbooruTagger 核心引擎
+DanbooruTagger core engine for the ComfyUI plugin.
 
-缓存格式（存于 cache_dir/ 目录）：
-  embeddings.safetensors   — 四路向量矩阵（FP16），行顺序与 metadata.parquet 完全对齐
-  metadata.parquet         — DataFrame（name/cn_name/cn_core/wiki/nsfw/category/post_count）
-  meta.json                — 标量元数据（max_log_count、schema_version）
+Cache layout (under cache_dir/):
+  danbooru_multiview_embeddings.safetensors  — four-view FP16 tensor matrix
+  tags_metadata.parquet                      — DataFrame (name/cn_name/cn_core/wiki/nsfw/category/post_count)
+  version_data.json                          — scalar metadata (schema_version, updated_at)
 """
 
 from __future__ import annotations
-from huggingface_hub import hf_hub_download
+
 import asyncio
 import json
 import os
 import re
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -28,10 +28,6 @@ from sentence_transformers import SentenceTransformer, util
 
 from .models import SearchRequest, SearchResponse, TagResult
 
-
-# ──────────────────────────────────────────────
-# 常量
-# ──────────────────────────────────────────────
 
 STOP_WORDS: frozenset[str] = frozenset({
     ',', '.', ':', ';', '?', '!', '"', "'", '`',
@@ -53,6 +49,14 @@ STOP_WORDS: frozenset[str] = frozenset({
     '很', '太', '更', '最', '挺', '特', '好', '真',
     '一', '一个', '一种', '一下', '一点', '一些',
     '有', '无', '非', '没', '不',
+    '正在', '已经', '正', '刚', '开始', '继续', '一直', '不断',
+    '穿着', '戴着', '穿', '戴',
+    '带有', '具有', '拥有',
+    '看起来', '看上去', '显得', '仿佛', '似乎',
+    '十分', '非常', '特别', '比较',
+    '图片', '画面', '图像',
+    '位于', '处于',
+    '许多', '大量', '各种', '所有', '其他', '其它',
 })
 
 CAT_MAP: dict[str, str] = {
@@ -61,15 +65,8 @@ CAT_MAP: dict[str, str] = {
 
 LOCAL_MODEL_PATH = 'my_model_bge_m3'
 HF_MODEL_ID      = 'BAAI/bge-m3'
-SCHEMA_VERSION   = 2   # 升级此值将自动触发全量重建，用于破坏性格式变更
+SCHEMA_VERSION   = 2
 
-
-def is_running_on_huggingface_space() -> bool:
-    return os.environ.get("SPACE_ID") is not None
-
-# ──────────────────────────────────────────────
-# 缓存路径助手
-# ──────────────────────────────────────────────
 
 class _CachePaths:
     def __init__(self, cache_dir: str | Path):
@@ -90,41 +87,40 @@ class _CachePaths:
 
 
 class DanbooruTagger:
-    """核心搜索引擎（单例）"""
+    """Core search engine (singleton)."""
 
     _instance: Optional['DanbooruTagger'] = None
     _lock: Optional[asyncio.Lock] = None
 
     @classmethod
     def is_ready(cls) -> bool:
-        """引擎单例是否已完成加载"""
         return cls._instance is not None and cls._instance.is_loaded
 
     @classmethod
     async def get_instance(cls, **kwargs) -> 'DanbooruTagger':
         if cls._lock is None:
             cls._lock = asyncio.Lock()
-
         async with cls._lock:
             if cls._instance is None:
                 inst = cls(**kwargs)
                 await asyncio.to_thread(inst.load)
                 cls._instance = inst
             return cls._instance
+
     def __init__(
         self,
         model_path: Optional[str] = None,
         csv_file:   str = 'origin_database/tags_enhanced.csv',
         cache_dir:  str = 'tags_embedding',
-        cooc_file:  str = 'origin_database/cooccurrence_clean.csv',
+        cooc_file:  str = 'origin_database/cooccurrence_clean.parquet',
     ):
         if model_path:
             self.model_path = model_path
         elif os.path.exists(LOCAL_MODEL_PATH):
-            print(f'[Engine] 检测到本地模型 "{LOCAL_MODEL_PATH}"，使用本地。')
+            print(f'[Engine] local model found at "{LOCAL_MODEL_PATH}"')
             self.model_path = LOCAL_MODEL_PATH
         else:
-            print(f'[Engine] 未找到本地模型，将使用 HF ID "{HF_MODEL_ID}"。')
+            print(f'[Engine] local model not found, will use HF id "{HF_MODEL_ID}"')
             self.model_path = HF_MODEL_ID
 
         self.csv_path  = csv_file
@@ -132,66 +128,32 @@ class DanbooruTagger:
         self.paths     = _CachePaths(cache_dir)
         self.cooc_file = cooc_file
 
-        self.model:         Optional[SentenceTransformer]         = None
-        self.df:            Optional[pd.DataFrame]                = None
-        self.emb_en:        Optional[torch.Tensor]                = None
-        self.emb_cn:        Optional[torch.Tensor]                = None
-        self.emb_wiki:      Optional[torch.Tensor]                = None
-        self.emb_cn_core:   Optional[torch.Tensor]                = None
-        self.max_log_count: float                                 = 15.0
-        # 共现表：tag -> [(neighbor, cooc_count), ...] 按 PMI 降序
-        self.cooc: dict[str, list[tuple[str, int]]]               = {}
-        # name -> df 行号索引，load() 完成后建立，避免 get_related 每次重建
-        self._name_to_idx: dict[str, int]                         = {}
-        self.is_loaded:     bool                                  = False
+        self.model:         Optional[SentenceTransformer]       = None
+        self.df:            Optional[pd.DataFrame]              = None
+        self.emb_en:        Optional[torch.Tensor]              = None
+        self.emb_cn:        Optional[torch.Tensor]              = None
+        self.emb_wiki:      Optional[torch.Tensor]              = None
+        self.emb_cn_core:   Optional[torch.Tensor]              = None
+        self.max_log_count: float                               = 15.0
+        self.cooc:          dict[str, list[tuple[str, int]]]    = {}
+        self._name_to_idx:  dict[str, int]                      = {}
+        self.is_loaded:     bool                                = False
 
-    # ── 初始化 ────────────────────────────────────────────────────────────
     def load(self) -> None:
-        """同步加载 在线程池中调用"""
+        """Synchronous load; call inside a thread pool."""
         if self.is_loaded:
             return
         t0 = time.time()
-        # ====== 新增：环境检测与强制拉取真实的 LFS 文件 ======
-        space_id = os.environ.get('SPACE_ID')
-        if space_id:
-            print(f'[Engine] 检测到 HF Space 线上环境 ({space_id})，正在拉取HF数据文件...')
-            try:
-                # 1. 拉取真实源数据
-                self.csv_path = hf_hub_download(repo_id=space_id, repo_type="space", filename="origin_database/tags_enhanced.csv")
-                self.cooc_file = hf_hub_download(repo_id=space_id, repo_type="space",
-                                                 filename="origin_database/cooccurrence_clean.parquet")
 
-                # 2. 拉取真实的缓存文件！
-                real_meta = hf_hub_download(repo_id=space_id, repo_type="space",
-                                            filename="tags_embedding/tags_metadata.parquet")
-                real_emb = hf_hub_download(repo_id=space_id, repo_type="space",
-                                           filename="tags_embedding/danbooru_multiview_embeddings.safetensors")
-                real_json = hf_hub_download(repo_id=space_id, repo_type="space",
-                                            filename="tags_embedding/version_data.json")
-
-                # 覆盖原来的路径，让底层读取我们刚刚下载好的真文件
-                from pathlib import Path
-                self.paths.metadata = Path(real_meta)
-                self.paths.embeddings = Path(real_emb)
-                self.paths.meta_json = Path(real_json)
-
-                print('[Engine] 线上真实数据和缓存文件拉取完毕！')
-            except Exception as e:
-                print(f'[Engine] 拉取线上文件警告 (可能影响启动): {e}')
-        else:
-            print('[Engine] 检测到本地环境，直接使用本地数据文件。')
-        # ============================================
         if not self.paths.exists():
-            print('\n' + '=' * 50)
-            print('[Engine] 未找到缓存，开始首次构建（约 1~3 分钟）...')
-            print('=' * 50 + '\n')
+            print('[Engine] no cache found, building from scratch (may take 1-3 min)...')
             self._load_model()
             self._build_full()
         else:
-            print(f'[Engine] 加载缓存 ({self.paths.dir}) ...')
+            print(f'[Engine] loading cache from {self.paths.dir}')
             self._load_from_cache()
             if self._cached_schema_version() != SCHEMA_VERSION:
-                print('[Engine] 缓存格式版本不符，触发全量重建...')
+                print('[Engine] cache schema mismatch, rebuilding...')
                 self._load_model()
                 self._build_full()
             elif os.path.exists(self.csv_path):
@@ -205,7 +167,7 @@ class DanbooruTagger:
         self._load_cooc()
         self._name_to_idx = {n: i for i, n in enumerate(self.df['name'])}
         self.is_loaded = True
-        print(f'[Engine] 初始化完成，耗时 {time.time() - t0:.2f}s')
+        print(f'[Engine] ready in {time.time() - t0:.2f}s')
 
     def search(self, request: SearchRequest) -> SearchResponse:
         if not self.is_loaded:
@@ -219,21 +181,30 @@ class DanbooruTagger:
             keywords = []
             queries  = [request.query]
 
-        q_emb = self.model.encode(queries, convert_to_tensor=True).float()
+        q_emb = self.model.encode(queries, convert_to_tensor=True, show_progress_bar=False).float()
         empty = [[] for _ in queries]
         tl    = request.target_layers
         k     = request.top_k
 
-        hits_en   = util.semantic_search(q_emb, self.emb_en,      top_k=k) if '英文'      in tl else empty
-        hits_cn   = util.semantic_search(q_emb, self.emb_cn,      top_k=k) if '中文扩展词' in tl else empty
-        hits_wiki = util.semantic_search(q_emb, self.emb_wiki,    top_k=k) if '释义'      in tl else empty
-        hits_core = util.semantic_search(q_emb, self.emb_cn_core, top_k=k) if '中文核心词' in tl else empty
+        layer_weights = self._detect_intent(request.query)
+        active_layers = [l for l in ['英文', '中文扩展词', '释义', '中文核心词'] if l in tl]
+        if active_layers:
+            aw       = {l: layer_weights.get(l, 1.0) for l in active_layers}
+            total_aw = sum(aw.values())
+            pvk      = {l: max(1, round(k * aw[l] / total_aw)) for l in active_layers}
+        else:
+            pvk = {}
+
+        hits_en   = util.semantic_search(q_emb, self.emb_en,      top_k=pvk.get('英文',      1)) if '英文'      in tl else empty
+        hits_cn   = util.semantic_search(q_emb, self.emb_cn,      top_k=pvk.get('中文扩展词', 1)) if '中文扩展词' in tl else empty
+        hits_wiki = util.semantic_search(q_emb, self.emb_wiki,    top_k=pvk.get('释义',       1)) if '释义'      in tl else empty
+        hits_core = util.semantic_search(q_emb, self.emb_cn_core, top_k=pvk.get('中文核心词', 1)) if '中文核心词' in tl else empty
 
         final: dict[str, TagResult] = {}
 
         for i, source_word in enumerate(queries):
             combined = (
-                [(h, '英文')       for h in hits_en[i]]
+                [(h, '英文')        for h in hits_en[i]]
                 + [(h, '中文扩展词') for h in hits_cn[i]]
                 + [(h, '释义')       for h in hits_wiki[i]]
                 + [(h, '中文核心词') for h in hits_core[i]]
@@ -251,7 +222,7 @@ class DanbooruTagger:
                 count       = row['post_count']
                 pop_score   = np.log1p(count) / self.max_log_count
                 w           = request.popularity_weight
-                final_score = score * (1 - w) + pop_score * w
+                final_score = score * layer_weights.get(layer, 1.0) * (1 - w) + pop_score * w
                 if tag_name not in final or final_score > final[tag_name].final_score:
                     final[tag_name] = TagResult(
                         tag=tag_name, cn_name=row['cn_name'], category=cat_text,
@@ -262,8 +233,25 @@ class DanbooruTagger:
                         wiki=str(row.get('wiki', '')),
                     )
 
+        # Guarantee the top-1 result per query source (above threshold).
+        guaranteed_tags: set[str] = set()
+        for source_word in queries:
+            best: TagResult | None = None
+            for r in final.values():
+                if r.source == source_word and r.final_score > 0.45:
+                    if best is None or r.final_score > best.final_score:
+                        best = r
+            if best is not None:
+                guaranteed_tags.add(best.tag)
+
         sorted_results = sorted(final.values(), key=lambda r: r.final_score, reverse=True)
-        valid    = [r for r in sorted_results if r.final_score > 0.45][: request.limit]
+        valid: list[TagResult] = []
+        for r in sorted_results:
+            if r.final_score <= 0.45:
+                continue
+            if len(valid) < request.limit or r.tag in guaranteed_tags:
+                valid.append(r)
+
         tags_all = ', '.join(r.tag for r in valid)
         tags_sfw = ', '.join(r.tag for r in valid if r.nsfw != '1')
         return SearchResponse(
@@ -271,31 +259,23 @@ class DanbooruTagger:
             results=valid, keywords=keywords,
         )
 
-    # 全量构建
-
     def _build_full(self) -> None:
-        print(f'[Engine] 全量读取 {self.csv_path} ...')
-        raw_df         = self._read_csv_robust(self.csv_path)
-        self.df        = self._preprocess_raw_df(raw_df)
+        print(f'[Engine] reading {self.csv_path}')
+        raw_df             = self._read_csv_robust(self.csv_path)
+        self.df            = self._preprocess_raw_df(raw_df)
         self.max_log_count = float(np.log1p(self.df['post_count'].max()))
         self._encode_all_and_save()
 
     def _encode_all_and_save(self) -> None:
-        print('[Engine] 全量编码...')
+        print('[Engine] encoding all rows...')
         self.emb_en      = self._encode_texts(self.df['name'].tolist())
         self.emb_cn      = self._encode_texts(self.df['cn_name'].tolist())
         self.emb_wiki    = self._encode_texts(self.df['wiki'].tolist())
         self.emb_cn_core = self._encode_texts(self.df['cn_core'].tolist())
         self._save_cache()
 
-    # 增量更新
-
     def _smart_update(self) -> None:
-        """
-        只 encode 变更行，不重建全库。
-        操作顺序：删除 → 修改 → 新增
-        """
-        print('[Engine] 检查增量变更...')
+        print('[Engine] checking for incremental changes...')
         t0 = time.time()
 
         raw_df = self._read_csv_robust(self.csv_path)
@@ -318,23 +298,21 @@ class DanbooruTagger:
         ]
 
         if not added_names and not deleted_names and not changed_names:
-            print('[Engine] 数据已是最新，无需更新。')
+            print('[Engine] data is up to date, skipping update')
             return
 
-        print(f'[Engine] 变更 → 新增: {len(added_names)}  修改: {len(changed_names)}  删除: {len(deleted_names)}')
+        print(f'[Engine] changes: +{len(added_names)} ~{len(changed_names)} -{len(deleted_names)}')
 
-        # 删除
         if deleted_names:
             keep_mask = ~self.df['name'].isin(set(deleted_names))
             keep_pos  = [i for i, v in enumerate(keep_mask) if v]
-            self.df        = self.df[keep_mask].reset_index(drop=True)
+            self.df          = self.df[keep_mask].reset_index(drop=True)
             self.emb_en      = self.emb_en[keep_pos]
             self.emb_cn      = self.emb_cn[keep_pos]
             self.emb_wiki    = self.emb_wiki[keep_pos]
             self.emb_cn_core = self.emb_cn_core[keep_pos]
             cached_idx = {n: i for i, n in enumerate(self.df['name'])}
 
-        # 修改
         if changed_names:
             changed_rows = new_df[new_df['name'].isin(set(changed_names))].reset_index(drop=True)
             vecs_en   = self._encode_texts(changed_rows['name'].tolist())
@@ -350,7 +328,6 @@ class DanbooruTagger:
                 for col in changed_rows.columns:
                     self.df.at[ci, col] = changed_rows.at[j, col]
 
-        # 新增
         if added_names:
             added_rows = new_df[new_df['name'].isin(set(added_names))].reset_index(drop=True)
             vecs_en   = self._encode_texts(added_rows['name'].tolist())
@@ -363,13 +340,10 @@ class DanbooruTagger:
             self.emb_cn_core = torch.cat([self.emb_cn_core, vecs_core], dim=0)
             self.df = pd.concat([self.df, added_rows], ignore_index=True)
 
-        # 保存
         self.max_log_count = float(np.log1p(self.df['post_count'].max()))
-        self._name_to_idx = {n: i for i, n in enumerate(self.df['name'])}
+        self._name_to_idx  = {n: i for i, n in enumerate(self.df['name'])}
         self._save_cache()
-        print(f'[Engine] 增量更新完成，耗时 {time.time() - t0:.2f}s（共 {len(self.df)} 条）')
-
-    # 缓存 I/O
+        print(f'[Engine] incremental update done in {time.time() - t0:.2f}s ({len(self.df)} rows)')
 
     def _save_cache(self) -> None:
         self.paths.ensure_dir()
@@ -384,9 +358,13 @@ class DanbooruTagger:
         )
         save_cols = ['name', 'cn_name', 'cn_core', 'wiki', 'nsfw', 'category', 'post_count']
         self.df[save_cols].to_parquet(str(self.paths.metadata), index=False)
+        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         with open(self.paths.meta_json, 'w', encoding='utf-8') as f:
-            json.dump({'schema_version': SCHEMA_VERSION}, f)
-        print(f'[Engine] 缓存保存完成（{len(self.df)} 条记录）')
+            json.dump({
+                'schema_version': SCHEMA_VERSION,
+                'updated_at':     current_time,
+            }, f, ensure_ascii=False, indent=4)
+        print(f'[Engine] cache saved ({len(self.df)} rows) at {current_time}')
 
     def _load_from_cache(self) -> None:
         tensors          = st_load(str(self.paths.embeddings), device=self.device)
@@ -394,9 +372,7 @@ class DanbooruTagger:
         self.emb_cn      = tensors['emb_cn'].float()
         self.emb_wiki    = tensors['emb_wiki'].float()
         self.emb_cn_core = tensors['emb_cn_core'].float()
-        self.df = pd.read_parquet(str(self.paths.metadata))
-        with open(self.paths.meta_json, 'r', encoding='utf-8') as f:
-            json.load(f)  # 仅读取，max_log_count 从 df 实时计算
+        self.df          = pd.read_parquet(str(self.paths.metadata))
         self.max_log_count = float(np.log1p(self.df['post_count'].max()))
 
     def _cached_schema_version(self) -> int:
@@ -406,21 +382,19 @@ class DanbooruTagger:
         except Exception:
             return 0
 
-    # 编码 & 预处理
-
     def _encode_texts(self, texts: list[str]) -> torch.Tensor:
         return self.model.encode(
-            texts, batch_size=64, show_progress_bar=len(texts) > 500, convert_to_tensor=True,
+            texts, batch_size=64, show_progress_bar=False, convert_to_tensor=True,
         ).float()
 
     def _load_model(self) -> None:
         if self.model is not None:
             return
-        print(f'[Engine] 加载模型 (path={self.model_path}, device={self.device})...')
+        print(f'[Engine] loading model (path={self.model_path}, device={self.device})')
         try:
             self.model = SentenceTransformer(self.model_path, device=self.device)
         except Exception as e:
-            print(f'[Engine] 本地模型失败，回退到 HF: {e}')
+            print(f'[Engine] model load failed, falling back to HF: {e}')
             self.model = SentenceTransformer(HF_MODEL_ID, device=self.device)
 
     def _read_csv_robust(self, path: str) -> pd.DataFrame:
@@ -429,18 +403,17 @@ class DanbooruTagger:
                 return pd.read_csv(path, dtype=str, encoding=enc).fillna('')
             except UnicodeDecodeError:
                 continue
-        raise ValueError('CSV 读取失败，请检查编码')
+        raise ValueError(f'failed to read CSV with any known encoding: {path}')
 
     def _preprocess_raw_df(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
-        print("Current columns:", df.columns.tolist())
         df.dropna(subset=['name'], inplace=True)
         df = df[df['name'].str.strip() != '']
         for col in ['cn_name', 'category', 'wiki', 'nsfw']:
             if col not in df.columns:
                 df[col] = ''
-        df['category']   = df['category'].fillna('0')
-        df['nsfw']       = df['nsfw'].fillna('0')
+        df['category'] = df['category'].fillna('0')
+        df['nsfw']     = df['nsfw'].fillna('0')
         for char in ['，', '|', '、']:
             df['cn_name'] = df['cn_name'].str.replace(char, ',', regex=False)
         if 'post_count' not in df.columns:
@@ -465,6 +438,29 @@ class DanbooruTagger:
         for word in unique_words:
             jieba.add_word(word, 2000)
 
+    def _detect_intent(self, query: str) -> dict[str, float]:
+        """
+        Infer per-layer weight coefficients from the query's language characteristics.
+        Values > 1.0 boost a layer; < 1.0 down-weight it.
+        """
+        stripped = query.replace(' ', '')
+        cn_chars = sum(1 for c in stripped if '\u4e00' <= c <= '\u9fff')
+        en_chars = sum(1 for c in stripped if c.isascii() and c.isalpha())
+        total    = max(len(stripped), 1)
+        is_long  = len(query) > 8
+        is_cn    = cn_chars / total > 0.5
+        is_en    = en_chars / total > 0.5
+
+        if is_long and is_cn:
+            return {'英文': 0.8, '中文核心词': 0.9, '中文扩展词': 1.1, '释义': 1.4}
+        if is_long and is_en:
+            return {'英文': 1.0, '中文核心词': 0.8, '中文扩展词': 0.9, '释义': 1.3}
+        if is_cn:
+            return {'英文': 0.8, '中文核心词': 1.3, '中文扩展词': 1.1, '释义': 0.6}
+        if is_en:
+            return {'英文': 1.3, '中文核心词': 1.0, '中文扩展词': 0.8, '释义': 0.6}
+        return {'英文': 1.0, '中文核心词': 1.0, '中文扩展词': 1.0, '释义': 1.0}
+
     def _smart_split(self, text: str) -> list[str]:
         tokens: list[str] = []
         for chunk in re.split(r'([一-龥]+)', text):
@@ -481,8 +477,6 @@ class DanbooruTagger:
                         tokens.append(part)
         return tokens
 
-    # 关联推荐
-
     def get_related(
         self,
         seed_tags: list[str],
@@ -490,43 +484,60 @@ class DanbooruTagger:
         limit: int = 20,
         show_nsfw: bool = True,
     ) -> list:
-        """
-        给定种子 tag 列表，从共现表查关联推荐。
-        对每个种子 tag 取共现邻居并累加 count，按累加分降序返回。
-        """
         from .models import RelatedTag
+        import math
+
         if not self.cooc or not seed_tags:
             return []
         exclude = exclude or set()
-        scores: dict[str, int] = {}
-        tag_sources: dict[str, list[str]] = {}   # neighbor -> 触发它的种子 tag 列表
+
+        total_posts = float(max(self.df['post_count'].max(), 7000000.0))
+
+        npmi_scores: dict[str, float] = {}
+        total_cooc:  dict[str, int]   = {}
+        tag_sources: dict[str, list[str]] = {}
+        name_to_idx = self._name_to_idx
+
         for seed in seed_tags:
+            if seed not in name_to_idx:
+                continue
+            seed_count = float(self.df.iloc[name_to_idx[seed]].get('post_count', 1) or 1)
+
             for neighbor, cnt in self.cooc.get(seed, []):
                 if neighbor in exclude or neighbor == seed:
                     continue
-                scores[neighbor] = scores.get(neighbor, 0) + cnt
+                if neighbor not in name_to_idx:
+                    continue
+
+                neighbor_count = float(
+                    self.df.iloc[name_to_idx[neighbor]].get('post_count', 1) or 1
+                )
+                cooc = min(float(cnt), seed_count, neighbor_count)
+                if cooc <= 0:
+                    continue
+
+                numerator = (cooc * total_posts) / (seed_count * neighbor_count)
+                if numerator <= 1.0:
+                    continue
+
+                pmi   = math.log(numerator)
+                p_a_b = cooc / total_posts
+                npmi  = 1.0 if p_a_b >= 1.0 else pmi / -math.log(p_a_b)
+
+                npmi_scores[neighbor] = npmi_scores.get(neighbor, 0.0) + npmi
+                total_cooc[neighbor]  = total_cooc.get(neighbor, 0) + cnt
                 tag_sources.setdefault(neighbor, []).append(seed)
-        if not scores:
+
+        if not npmi_scores:
             return []
 
-        # 归一化：除以 post_count^0.5，压制超高频 tag ──
-        name_to_idx = self._name_to_idx  # 使用预建索引
-        normalized: dict[str, float] = {}
-        for tag_name, raw_score in scores.items():
-            if tag_name in name_to_idx:
-                post_count = float(self.df.iloc[name_to_idx[tag_name]].get('post_count', 1) or 1)
-                normalized[tag_name] = raw_score / (post_count ** 0.5)
-            else:
-                normalized[tag_name] = float(raw_score)
-
-        max_score = max(normalized.values())
-        sorted_candidates = sorted(normalized.items(), key=lambda x: x[1], reverse=True)
+        max_score        = max(npmi_scores.values())
+        sorted_candidates = sorted(npmi_scores.items(), key=lambda x: x[1], reverse=True)
         results = []
-        for tag_name, norm_score in sorted_candidates:
+
+        for tag_name, raw_score in sorted_candidates:
             if len(results) >= limit:
                 break
-            if tag_name not in name_to_idx:
-                continue
             row  = self.df.iloc[name_to_idx[tag_name]]
             nsfw = str(row.get('nsfw', '0'))
             if nsfw == '1' and not show_nsfw:
@@ -537,21 +548,17 @@ class DanbooruTagger:
                 cn_name=str(row.get('cn_name', '')),
                 category=cat,
                 nsfw=nsfw,
-                cooc_count=scores[tag_name],
-                cooc_score=round(norm_score / max_score, 4),
+                cooc_count=total_cooc[tag_name],
+                cooc_score=round(raw_score / max_score, 4),
                 sources=tag_sources.get(tag_name, []),
             ))
+
         return results
 
     def _load_cooc(self) -> None:
-        """
-        加载共现表到内存 dict，文件不存在时静默跳过。
-        """
-        # 确定实际要读的源文件（支持直接传入 parquet）
         csv_path     = Path(self.cooc_file)
         parquet_path = csv_path.with_suffix('.parquet')
 
-        # 选择读取路径
         if parquet_path.is_file() and (
             not csv_path.is_file()
             or parquet_path.stat().st_mtime >= csv_path.stat().st_mtime
@@ -562,10 +569,10 @@ class DanbooruTagger:
             read_path  = csv_path
             is_parquet = False
         else:
-            print(f'[Engine] 未找到共现表 ({self.cooc_file})，关联推荐功能不可用。')
+            print(f'[Engine] co-occurrence table not found ({self.cooc_file}), related tags disabled')
             return
 
-        print(f'[Engine] 加载共现表 ({read_path.name})...')
+        print(f'[Engine] loading co-occurrence table ({read_path.name})...')
         t0 = time.time()
         try:
             if is_parquet:
@@ -574,7 +581,7 @@ class DanbooruTagger:
                 df = self._read_csv_robust(str(read_path))
                 df['count'] = pd.to_numeric(df['count'], errors='coerce').fillna(0).astype(int)
                 df.to_parquet(str(parquet_path), index=False)
-                print(f'[Engine] 已将共现表缓存为 {parquet_path.name}，下次启动将直接加载。')
+                print(f'[Engine] co-occurrence table cached as {parquet_path.name}')
 
             tag_a  = df['tag_a'].astype(str).to_numpy()
             tag_b  = df['tag_b'].astype(str).to_numpy()
@@ -584,8 +591,7 @@ class DanbooruTagger:
             dst = np.concatenate([tag_b, tag_a])
             cnt = np.concatenate([counts, counts])
 
-
-            sort_idx = np.lexsort((-cnt, src))   # 先按 src 升序，再按 cnt 降序
+            sort_idx = np.lexsort((-cnt, src))
             src = src[sort_idx]
             dst = dst[sort_idx]
             cnt = cnt[sort_idx]
@@ -599,8 +605,8 @@ class DanbooruTagger:
 
             self.cooc = cooc
             print(
-                f'[Engine] 共现表加载完成，{len(cooc):,} 个 tag，'
-                f'耗时 {time.time() - t0:.2f}s'
+                f'[Engine] co-occurrence table loaded: {len(cooc):,} tags, '
+                f'{time.time() - t0:.2f}s'
             )
         except Exception as e:
-            print(f'[Engine] 共现表加载失败: {e}')
+            print(f'[Engine] failed to load co-occurrence table: {e}')
