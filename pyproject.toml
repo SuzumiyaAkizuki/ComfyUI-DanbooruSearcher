@@ -1,7 +1,7 @@
 [project]
 name = "DanbooruSearcher"
 description = "This Node provides a method for fuzzy searching Danbooru tags. Users can find corresponding tags in the Danbooru dataset using fuzzy linguistic descriptions."
-version = "1.2.6"
+version = "1.2.7"
 license = {file = "LICENSE"} 
 # classifiers = [
 #     # For OS-independent nodes (works on all operating systems)

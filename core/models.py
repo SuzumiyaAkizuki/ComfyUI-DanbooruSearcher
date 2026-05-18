@@ -25,6 +25,8 @@ class RelatedTag:
     cooc_count: int
     cooc_score: float
     sources: list[str] = field(default_factory=list)
+    post_count: int = 0   # 该标签的发帖总数（与 search_tags 的 count 对齐）
+    wiki: str = ""        # 标签 wiki 描述
 
 
 @dataclass
@@ -49,3 +51,4 @@ class SearchResponse:
     tags_sfw: str
     results: list[TagResult]
     keywords: list[str]
+    segments: list[str] = field(default_factory=list)  # 分隔符切分后的原始从句级片段

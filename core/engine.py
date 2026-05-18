@@ -12,28 +12,34 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
 import time
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import jieba
 import numpy as np
 import pandas as pd
 import torch
 from safetensors.torch import load_file as st_load, save_file as st_save
-from sentence_transformers import SentenceTransformer, util
+from sentence_transformers import SentenceTransformer
 
 from .models import SearchRequest, SearchResponse, TagResult
 
+
+# ──────────────────────────────────────────────
+# 停用词
+# ──────────────────────────────────────────────
 
 STOP_WORDS: frozenset[str] = frozenset({
     ',', '.', ':', ';', '?', '!', '"', "'", '`',
     '(', ')', '[', ']', '{', '}', '<', '>',
     '-', '_', '=', '+', '/', '\\', '|', '@', '#', '$', '%', '^', '&', '*', '~',
-    '，', '。', '：', '；', '？', '！', '\u201c', '\u201d', '\u2018', '\u2019',
+    '，', '。', '：', '；', '？', '！', '“', '”', '‘', '’',
     '（', '）', '【', '】', '《', '》', '、', '…', '—', '·',
     ' ', '\t', '\n', '\r',
     '的', '地', '得', '了', '着', '过',
@@ -57,6 +63,23 @@ STOP_WORDS: frozenset[str] = frozenset({
     '图片', '画面', '图像',
     '位于', '处于',
     '许多', '大量', '各种', '所有', '其他', '其它',
+    # ── 英文停用词 ──
+    'a', 'an', 'the',
+    'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'from', 'as', 'into',
+    'about', 'between', 'through', 'after', 'before', 'above', 'below',
+    'and', 'or', 'but', 'nor', 'so', 'yet',
+    'is', 'are', 'was', 'were', 'be', 'been', 'being',
+    'do', 'does', 'did', 'done',
+    'have', 'has', 'had', 'having',
+    'will', 'would', 'shall', 'should', 'can', 'could', 'may', 'might', 'must',
+    'not', 'no', 'very', 'too', 'also', 'just', 'only', 'even', 'still',
+    'i', 'me', 'my', 'we', 'our', 'you', 'your', 'he', 'him', 'his',
+    'she', 'her', 'it', 'its', 'they', 'them', 'their',
+    'this', 'that', 'these', 'those', 'which', 'who', 'whom', 'what',
+    'there', 'here', 'where', 'when', 'how', 'all', 'each', 'every',
+    'some', 'any', 'few', 'more', 'most', 'other', 'such',
+    'than', 'up', 'out', 'if', 'then', 'else', 'while', 'during',
+    'both', 'same', 'own', 'now',
 })
 
 CAT_MAP: dict[str, str] = {
@@ -65,8 +88,54 @@ CAT_MAP: dict[str, str] = {
 
 LOCAL_MODEL_PATH = 'my_model_bge_m3'
 HF_MODEL_ID      = 'BAAI/bge-m3'
-SCHEMA_VERSION   = 2
+SCHEMA_VERSION   = 3
 
+# 用户显式分隔后，纯 CJK 片段超过此长度仍用 jieba 切分
+_ATOMIC_CJK_MAX_LEN = 7
+
+# 四路 embedding 层配置: (层名, tensor 属性名, DataFrame 列名)
+_LAYER_SPEC: list[tuple[str, str, str]] = [
+    ('英文',   'emb_en',      'name'),
+    ('中文扩展词', 'emb_cn',      'cn_name'),
+    ('释义',   'emb_wiki',    'wiki'),
+    ('中文核心词', 'emb_cn_core', 'cn_core'),
+]
+_ALL_LAYER_NAMES = [ln for ln, _, _ in _LAYER_SPEC]
+
+# 英文复合标签最大单词数
+_EN_MAX_COMPOUND = 4
+
+
+# ──────────────────────────────────────────────
+# LRU 缓存
+# ──────────────────────────────────────────────
+
+class LRUCache:
+    def __init__(self, maxsize: int):
+        self._cache: OrderedDict[Any, Any] = OrderedDict()
+        self._maxsize = maxsize
+
+    def get(self, key: Any) -> Any:
+        if key not in self._cache:
+            return None
+        self._cache.move_to_end(key)
+        return self._cache[key]
+
+    def put(self, key: Any, value: Any) -> None:
+        if key in self._cache:
+            self._cache.move_to_end(key)
+        else:
+            if len(self._cache) >= self._maxsize:
+                self._cache.popitem(last=False)
+        self._cache[key] = value
+
+    def __len__(self) -> int:
+        return len(self._cache)
+
+
+# ──────────────────────────────────────────────
+# 缓存路径助手
+# ──────────────────────────────────────────────
 
 class _CachePaths:
     def __init__(self, cache_dir: str | Path):
@@ -139,6 +208,20 @@ class DanbooruTagger:
         self._name_to_idx:  dict[str, int]                      = {}
         self.is_loaded:     bool                                = False
 
+        # 预提取的列数组，避免热点路径上反复执行 df.iloc[idx]
+        self._arr_name:       Optional[np.ndarray] = None
+        self._arr_cn_name:    Optional[np.ndarray] = None
+        self._arr_category:   Optional[np.ndarray] = None
+        self._arr_nsfw:       Optional[np.ndarray] = None
+        self._arr_wiki:       Optional[np.ndarray] = None
+        self._arr_post_count: Optional[np.ndarray] = None
+        self._arr_pop_score:  Optional[np.ndarray] = None
+
+        # 三层 LRU 缓存（纯内存，重启后自动重热）
+        self._emb_cache:     LRUCache = LRUCache(maxsize=10_000)
+        self._search_cache:  LRUCache = LRUCache(maxsize=5_000)
+        self._related_cache: LRUCache = LRUCache(maxsize=2_000)
+
     def load(self) -> None:
         """Synchronous load; call inside a thread pool."""
         if self.is_loaded:
@@ -166,74 +249,163 @@ class DanbooruTagger:
         self._setup_jieba_from_memory()
         self._load_cooc()
         self._name_to_idx = {n: i for i, n in enumerate(self.df['name'])}
+        self._tag_names_set: set[str] = set(self._name_to_idx.keys())
+        self._rebuild_arrays_from_df()
+        self._normalize_embeddings()
         self.is_loaded = True
         print(f'[Engine] ready in {time.time() - t0:.2f}s')
+
+    def _normalize_embeddings(self) -> None:
+        """L2 归一化四路 embedding，使 search 阶段可直接用矩阵乘得 cosine similarity。"""
+        for _, attr, _ in _LAYER_SPEC:
+            t = getattr(self, attr)
+            if t is None:
+                continue
+            setattr(self, attr, torch.nn.functional.normalize(t, p=2, dim=1))
+
+    def _rebuild_arrays_from_df(self) -> None:
+        """将 DataFrame 中搜索热点路径需要的列预提取为 numpy 数组。"""
+        if self.df is None:
+            return
+        self._arr_name       = self.df['name'].to_numpy()
+        self._arr_cn_name    = self.df['cn_name'].to_numpy()
+        self._arr_category   = self.df['category'].astype(str).to_numpy()
+        self._arr_nsfw       = self.df['nsfw'].astype(str).to_numpy()
+        self._arr_wiki       = self.df['wiki'].astype(str).to_numpy()
+        self._arr_post_count = self.df['post_count'].to_numpy()
+        max_log = self.max_log_count if self.max_log_count > 0 else 1.0
+        self._arr_pop_score  = np.log1p(self._arr_post_count) / max_log
+
+    # ── 搜索 ──────────────────────────────────────────────────────────────
+
+    def _encode_queries(self, queries: list[str]) -> torch.Tensor:
+        """批量编码查询词，命中 embedding 缓存的跳过 model.encode。"""
+        cached_vecs: list[Optional[torch.Tensor]] = [self._emb_cache.get(q) for q in queries]
+        uncached_idx = [i for i, v in enumerate(cached_vecs) if v is None]
+
+        if uncached_idx:
+            uncached_texts = [queries[i] for i in uncached_idx]
+            new_embs = self.model.encode(
+                uncached_texts, convert_to_tensor=True, show_progress_bar=False,
+            ).float()
+            new_embs = torch.nn.functional.normalize(new_embs, p=2, dim=1)
+            for j, i in enumerate(uncached_idx):
+                emb = new_embs[j]
+                self._emb_cache.put(queries[i], emb)
+                cached_vecs[i] = emb
+
+        return torch.stack(cached_vecs)  # type: ignore[arg-type]
 
     def search(self, request: SearchRequest) -> SearchResponse:
         if not self.is_loaded:
             self.load()
 
+        cache_key = (
+            request.query,
+            request.top_k,
+            request.limit,
+            request.popularity_weight,
+            request.use_segmentation,
+            tuple(sorted(request.target_layers)),
+            tuple(sorted(request.target_categories)),
+        )
+        cached = self._search_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         if request.use_segmentation:
-            raw_kw   = self._smart_split(request.query)
+            raw_kw, raw_segments = self._smart_split(request.query)
             keywords = [w.strip() for w in raw_kw if w.strip() and w.strip() not in STOP_WORDS]
-            queries  = [request.query] + keywords
+            keywords_set = set(keywords)
+            extra_segments = [s for s in raw_segments if s != request.query and s not in keywords_set]
+            queries = [request.query] + extra_segments + keywords
         else:
             keywords = []
+            extra_segments = []
             queries  = [request.query]
 
-        q_emb = self.model.encode(queries, convert_to_tensor=True, show_progress_bar=False).float()
-        empty = [[] for _ in queries]
+        q_emb = self._encode_queries(queries)
+
         tl    = request.target_layers
         k     = request.top_k
 
-        layer_weights = self._detect_intent(request.query)
-        active_layers = [l for l in ['英文', '中文扩展词', '释义', '中文核心词'] if l in tl]
-        if active_layers:
-            aw       = {l: layer_weights.get(l, 1.0) for l in active_layers}
-            total_aw = sum(aw.values())
-            pvk      = {l: max(1, round(k * aw[l] / total_aw)) for l in active_layers}
-        else:
-            pvk = {}
+        # 每个查询词单独做意图识别
+        query_weights = [self._detect_intent(q) for q in queries]
+        active_layers = [ln for ln in _ALL_LAYER_NAMES if ln in tl]
 
-        hits_en   = util.semantic_search(q_emb, self.emb_en,      top_k=pvk.get('英文',      1)) if '英文'      in tl else empty
-        hits_cn   = util.semantic_search(q_emb, self.emb_cn,      top_k=pvk.get('中文扩展词', 1)) if '中文扩展词' in tl else empty
-        hits_wiki = util.semantic_search(q_emb, self.emb_wiki,    top_k=pvk.get('释义',       1)) if '释义'      in tl else empty
-        hits_core = util.semantic_search(q_emb, self.emb_cn_core, top_k=pvk.get('中文核心词', 1)) if '中文核心词' in tl else empty
+        # 预算每个 query × 每个 layer 的 top_k 配额
+        cur_pvk_per_q: list[dict[str, int]] = []
+        for cur_weights in query_weights:
+            if active_layers:
+                aw       = {l: cur_weights.get(l, 1.0) for l in active_layers}
+                total_aw = sum(aw.values())
+                cur_pvk  = {l: max(1, round(k * aw[l] / total_aw)) for l in active_layers}
+            else:
+                cur_pvk = {}
+            cur_pvk_per_q.append(cur_pvk)
+
+        target_cats = request.target_categories
+        w_pop       = request.popularity_weight
 
         final: dict[str, TagResult] = {}
 
-        for i, source_word in enumerate(queries):
-            combined = (
-                [(h, '英文')        for h in hits_en[i]]
-                + [(h, '中文扩展词') for h in hits_cn[i]]
-                + [(h, '释义')       for h in hits_wiki[i]]
-                + [(h, '中文核心词') for h in hits_core[i]]
-            )
-            for hit, layer in combined:
-                score = hit['score']
-                if score < 0.35:
-                    continue
-                idx      = hit['corpus_id']
-                row      = self.df.iloc[idx]
-                cat_text = CAT_MAP.get(str(row.get('category', '0')), 'Other')
-                if cat_text not in request.target_categories:
-                    continue
-                tag_name    = row['name']
-                count       = row['post_count']
-                pop_score   = np.log1p(count) / self.max_log_count
-                w           = request.popularity_weight
-                final_score = score * layer_weights.get(layer, 1.0) * (1 - w) + pop_score * w
-                if tag_name not in final or final_score > final[tag_name].final_score:
-                    final[tag_name] = TagResult(
-                        tag=tag_name, cn_name=row['cn_name'], category=cat_text,
-                        nsfw=str(row.get('nsfw', '0')),
-                        final_score=round(float(final_score), 4),
-                        semantic_score=round(float(score), 4),
-                        count=int(count), source=source_word, layer=layer,
-                        wiki=str(row.get('wiki', '')),
-                    )
+        # 按 layer 批量做矩阵乘 + topk，合并为 L=4 次大调用
+        for ln, attr, _ in _LAYER_SPEC:
+            if ln not in tl:
+                continue
+            emb_matrix = getattr(self, attr)   # (N, D)，已归一化
+            if emb_matrix is None:
+                continue
 
-        # Guarantee the top-1 result per query source (above threshold).
+            k_max = max((cur_pvk_per_q[i].get(ln, 1) for i in range(len(queries))), default=1)
+            k_max = min(k_max, emb_matrix.shape[0])
+
+            scores = q_emb @ emb_matrix.T                       # (Q, N)
+            top_v, top_i = scores.topk(k_max, dim=1)            # (Q, k_max)
+            top_v_list = top_v.tolist()
+            top_i_list = top_i.tolist()
+
+            for i, source_word in enumerate(queries):
+                cur_weights = query_weights[i]
+                kq = cur_pvk_per_q[i].get(ln, 1)
+                layer_w = cur_weights.get(ln, 1.0)
+                row_v = top_v_list[i]
+                row_i = top_i_list[i]
+                for j in range(min(kq, len(row_v))):
+                    score = row_v[j]
+                    if score < 0.35:
+                        break
+                    idx = row_i[j]
+                    cat_text = CAT_MAP.get(self._arr_category[idx], 'Other')
+                    if cat_text not in target_cats:
+                        continue
+                    tag_name    = self._arr_name[idx]
+                    count       = self._arr_post_count[idx]
+                    pop_score   = self._arr_pop_score[idx]
+                    final_score = score * layer_w * (1 - w_pop) + pop_score * w_pop
+                    if tag_name not in final or final_score > final[tag_name].final_score:
+                        final[tag_name] = TagResult(
+                            tag=tag_name, cn_name=self._arr_cn_name[idx], category=cat_text,
+                            nsfw=self._arr_nsfw[idx],
+                            final_score=round(float(final_score), 4),
+                            semantic_score=round(float(score), 4),
+                            count=int(count), source=source_word, layer=ln,
+                            wiki=self._arr_wiki[idx],
+                        )
+
+        # ── 全句语义一致性软重排 ──────────────────────────────────────────
+        full_q = q_emb[0]          # queries[0] 始终为完整原始查询
+        alpha  = 0.3 if request.use_segmentation else 0
+        for r in final.values():
+            idx = self._name_to_idx[r.tag]
+            max_co = 0.0
+            for ln, attr, _ in _LAYER_SPEC:
+                if ln not in tl:
+                    continue
+                max_co = max(max_co, float(torch.dot(full_q, getattr(self, attr)[idx])))
+            r.final_score = round(r.final_score * (1.0 - alpha + alpha * max_co), 4)
+
+        # 收集每个查询源的 top-1 结果（高于阈值）
         guaranteed_tags: set[str] = set()
         for source_word in queries:
             best: TagResult | None = None
@@ -254,10 +426,12 @@ class DanbooruTagger:
 
         tags_all = ', '.join(r.tag for r in valid)
         tags_sfw = ', '.join(r.tag for r in valid if r.nsfw != '1')
-        return SearchResponse(
+        response = SearchResponse(
             tags_all=tags_all, tags_sfw=tags_sfw,
-            results=valid, keywords=keywords,
+            results=valid, keywords=keywords, segments=extra_segments,
         )
+        self._search_cache.put(cache_key, response)
+        return response
 
     def _build_full(self) -> None:
         print(f'[Engine] reading {self.csv_path}')
@@ -268,10 +442,8 @@ class DanbooruTagger:
 
     def _encode_all_and_save(self) -> None:
         print('[Engine] encoding all rows...')
-        self.emb_en      = self._encode_texts(self.df['name'].tolist())
-        self.emb_cn      = self._encode_texts(self.df['cn_name'].tolist())
-        self.emb_wiki    = self._encode_texts(self.df['wiki'].tolist())
-        self.emb_cn_core = self._encode_texts(self.df['cn_core'].tolist())
+        for _, attr, col in _LAYER_SPEC:
+            setattr(self, attr, self._encode_texts(self.df[col].tolist()))
         self._save_cache()
 
     def _smart_update(self) -> None:
@@ -306,54 +478,40 @@ class DanbooruTagger:
         if deleted_names:
             keep_mask = ~self.df['name'].isin(set(deleted_names))
             keep_pos  = [i for i, v in enumerate(keep_mask) if v]
-            self.df          = self.df[keep_mask].reset_index(drop=True)
-            self.emb_en      = self.emb_en[keep_pos]
-            self.emb_cn      = self.emb_cn[keep_pos]
-            self.emb_wiki    = self.emb_wiki[keep_pos]
-            self.emb_cn_core = self.emb_cn_core[keep_pos]
+            self.df = self.df[keep_mask].reset_index(drop=True)
+            for _, attr, _ in _LAYER_SPEC:
+                setattr(self, attr, getattr(self, attr)[keep_pos])
             cached_idx = {n: i for i, n in enumerate(self.df['name'])}
 
         if changed_names:
             changed_rows = new_df[new_df['name'].isin(set(changed_names))].reset_index(drop=True)
-            vecs_en   = self._encode_texts(changed_rows['name'].tolist())
-            vecs_cn   = self._encode_texts(changed_rows['cn_name'].tolist())
-            vecs_wiki = self._encode_texts(changed_rows['wiki'].tolist())
-            vecs_core = self._encode_texts(changed_rows['cn_core'].tolist())
+            _vecs = {attr: self._encode_texts(changed_rows[col].tolist()) for _, attr, col in _LAYER_SPEC}
             for j, name in enumerate(changed_rows['name']):
                 ci = cached_idx[name]
-                self.emb_en[ci]      = vecs_en[j]
-                self.emb_cn[ci]      = vecs_cn[j]
-                self.emb_wiki[ci]    = vecs_wiki[j]
-                self.emb_cn_core[ci] = vecs_core[j]
+                for _, attr, _ in _LAYER_SPEC:
+                    getattr(self, attr)[ci] = _vecs[attr][j]
                 for col in changed_rows.columns:
                     self.df.at[ci, col] = changed_rows.at[j, col]
 
         if added_names:
             added_rows = new_df[new_df['name'].isin(set(added_names))].reset_index(drop=True)
-            vecs_en   = self._encode_texts(added_rows['name'].tolist())
-            vecs_cn   = self._encode_texts(added_rows['cn_name'].tolist())
-            vecs_wiki = self._encode_texts(added_rows['wiki'].tolist())
-            vecs_core = self._encode_texts(added_rows['cn_core'].tolist())
-            self.emb_en      = torch.cat([self.emb_en,      vecs_en],   dim=0)
-            self.emb_cn      = torch.cat([self.emb_cn,      vecs_cn],   dim=0)
-            self.emb_wiki    = torch.cat([self.emb_wiki,    vecs_wiki], dim=0)
-            self.emb_cn_core = torch.cat([self.emb_cn_core, vecs_core], dim=0)
+            for _, attr, col in _LAYER_SPEC:
+                vecs = self._encode_texts(added_rows[col].tolist())
+                setattr(self, attr, torch.cat([getattr(self, attr), vecs], dim=0))
             self.df = pd.concat([self.df, added_rows], ignore_index=True)
 
         self.max_log_count = float(np.log1p(self.df['post_count'].max()))
         self._name_to_idx  = {n: i for i, n in enumerate(self.df['name'])}
+        self._tag_names_set = set(self._name_to_idx.keys())
+        self._rebuild_arrays_from_df()
+        self._normalize_embeddings()
         self._save_cache()
         print(f'[Engine] incremental update done in {time.time() - t0:.2f}s ({len(self.df)} rows)')
 
     def _save_cache(self) -> None:
         self.paths.ensure_dir()
         st_save(
-            {
-                'emb_en':      self.emb_en.half(),
-                'emb_cn':      self.emb_cn.half(),
-                'emb_wiki':    self.emb_wiki.half(),
-                'emb_cn_core': self.emb_cn_core.half(),
-            },
+            {attr: getattr(self, attr).half() for _, attr, _ in _LAYER_SPEC},
             str(self.paths.embeddings),
         )
         save_cols = ['name', 'cn_name', 'cn_core', 'wiki', 'nsfw', 'category', 'post_count']
@@ -368,10 +526,8 @@ class DanbooruTagger:
 
     def _load_from_cache(self) -> None:
         tensors          = st_load(str(self.paths.embeddings), device=self.device)
-        self.emb_en      = tensors['emb_en'].float()
-        self.emb_cn      = tensors['emb_cn'].float()
-        self.emb_wiki    = tensors['emb_wiki'].float()
-        self.emb_cn_core = tensors['emb_cn_core'].float()
+        for _, attr, _ in _LAYER_SPEC:
+            setattr(self, attr, tensors[attr].float())
         self.df          = pd.read_parquet(str(self.paths.metadata))
         self.max_log_count = float(np.log1p(self.df['post_count'].max()))
 
@@ -439,12 +595,9 @@ class DanbooruTagger:
             jieba.add_word(word, 2000)
 
     def _detect_intent(self, query: str) -> dict[str, float]:
-        """
-        Infer per-layer weight coefficients from the query's language characteristics.
-        Values > 1.0 boost a layer; < 1.0 down-weight it.
-        """
+        """根据查询词特征返回各视图的语义分系数。"""
         stripped = query.replace(' ', '')
-        cn_chars = sum(1 for c in stripped if '\u4e00' <= c <= '\u9fff')
+        cn_chars = sum(1 for c in stripped if '一' <= c <= '鿿')
         en_chars = sum(1 for c in stripped if c.isascii() and c.isalpha())
         total    = max(len(stripped), 1)
         is_long  = len(query) > 8
@@ -461,21 +614,130 @@ class DanbooruTagger:
             return {'英文': 1.3, '中文核心词': 1.0, '中文扩展词': 0.8, '释义': 0.6}
         return {'英文': 1.0, '中文核心词': 1.0, '中文扩展词': 1.0, '释义': 1.0}
 
-    def _smart_split(self, text: str) -> list[str]:
+    # ── 查询切分 ──────────────────────────────────────────────────────────
+
+    def _smart_split(self, text: str) -> tuple[list[str], list[str]]:
+        """将查询文本拆分为关键词列表，同时返回从句级片段。
+
+        Returns:
+            (tokens, segments):
+            - tokens: 处理后的关键词列表
+            - segments: CN-region 切出的子句片段
+        """
+        user_pieces = [s.strip() for s in re.split(r'[\s\n\r，、；。]+', text) if s.strip()]
+        if not user_pieces:
+            return [], []
+        has_boundary = len(user_pieces) > 1
+
         tokens: list[str] = []
-        for chunk in re.split(r'([一-龥]+)', text):
-            if not chunk.strip():
+        segments: list[str] = []
+
+        cjk_region = r'[一-龥]+(?:[\s\n\r，、；。]+[一-龥]+)*'
+        parts = re.split(f'({cjk_region})', text)
+
+        for part in parts:
+            if not part.strip():
                 continue
-            if re.match(r'[一-龥]+', chunk):
-                tokens.extend(jieba.cut(chunk))
+
+            if re.search(r'[一-龥]', part):
+                cn_segs = [s.strip() for s in re.split(r'[\s\n\r，、；。]+', part) if s.strip()]
+                for seg in cn_segs:
+                    segments.append(seg)
+                    if has_boundary and re.match(r'^[一-龥]+$', seg) and len(seg) <= _ATOMIC_CJK_MAX_LEN:
+                        tokens.append(seg)
+                    else:
+                        for chunk in re.split(r'([一-龥]+)', seg):
+                            if not chunk.strip():
+                                continue
+                            if re.match(r'[一-龥]+', chunk):
+                                tokens.extend(jieba.cut(chunk))
+                            else:
+                                tokens.extend(self._tokenize_en_chunk(chunk))
             else:
-                cleaned = re.sub(r'[,()\[\]{}:]', ' ', chunk)
-                for part in cleaned.split():
-                    try:
-                        float(part)
-                    except ValueError:
-                        tokens.append(part)
-        return tokens
+                tokens.extend(self._tokenize_en_chunk(part))
+
+        return tokens, segments
+
+    # ── 英文分词辅助 ──────────────────────────────────────────────────────
+
+    def _tokenize_en_chunk(self, chunk: str) -> list[str]:
+        """对一段英文文本做分词：清洗 → 按空格切分 → 过滤停用词/纯数 → 变体规范化 → 合并已知复合标签。"""
+        cleaned = re.sub(r'[,()\[\]{}:]', ' ', chunk)
+        raw = [p for p in cleaned.split() if p]
+        tag_set = getattr(self, '_tag_names_set', None)
+        tokens: list[str] = []
+        for part in raw:
+            low = part.lower()
+            if tag_set and low in tag_set:
+                tokens.append(low)
+                continue
+            if low in STOP_WORDS:
+                continue
+            variant = self._resolve_tag_variant(low)
+            if variant:
+                tokens.append(variant)
+                continue
+            if part.isdigit():
+                continue
+            tokens.append(low)
+        if not tokens:
+            return []
+        return self._merge_compound_english(tokens)
+
+    def _resolve_tag_variant(self, low: str) -> str | None:
+        """对未直接命中 tag_set 的英文 token 探测常见变体。"""
+        tag_set = getattr(self, '_tag_names_set', None)
+        if not tag_set:
+            return None
+
+        bases = [low]
+        if '-' in low:
+            hyphen_normalized = low.replace('-', '_')
+            if hyphen_normalized in tag_set:
+                return hyphen_normalized
+            bases.append(hyphen_normalized)
+
+        for base in bases:
+            if base.endswith('s') and len(base) > 1:
+                v = base[:-1]
+                if v in tag_set:
+                    return v
+            if base.endswith('es') and len(base) > 2:
+                v = base[:-2]
+                if v in tag_set:
+                    return v
+            if base.endswith('ies') and len(base) > 3:
+                v = base[:-3] + 'y'
+                if v in tag_set:
+                    return v
+        return None
+
+    def _merge_compound_english(self, tokens: list[str]) -> list[str]:
+        """将相邻英文单词合并为已知的 Danbooru 下划线复合标签。"""
+        tag_set = getattr(self, '_tag_names_set', None)
+        if tag_set is None or len(tokens) < 2:
+            return tokens
+
+        result: list[str] = []
+        i = 0
+        max_w = min(_EN_MAX_COMPOUND, len(tokens))
+        while i < len(tokens):
+            merged = False
+            for w in range(max_w, 1, -1):
+                if i + w > len(tokens):
+                    continue
+                candidate = '_'.join(tokens[i:i + w])
+                if candidate in tag_set:
+                    result.append(candidate)
+                    i += w
+                    merged = True
+                    break
+            if not merged:
+                result.append(tokens[i])
+                i += 1
+        return result
+
+    # ── 关联推荐 ──────────────────────────────────────────────────────────
 
     def get_related(
         self,
@@ -485,11 +747,15 @@ class DanbooruTagger:
         show_nsfw: bool = True,
     ) -> list:
         from .models import RelatedTag
-        import math
 
         if not self.cooc or not seed_tags:
             return []
         exclude = exclude or set()
+
+        related_key = (tuple(sorted(seed_tags)), tuple(sorted(exclude)), limit, show_nsfw)
+        cached = self._related_cache.get(related_key)
+        if cached is not None:
+            return cached
 
         total_posts = float(max(self.df['post_count'].max(), 7000000.0))
 
@@ -497,11 +763,12 @@ class DanbooruTagger:
         total_cooc:  dict[str, int]   = {}
         tag_sources: dict[str, list[str]] = {}
         name_to_idx = self._name_to_idx
+        arr_post_count = self._arr_post_count
 
         for seed in seed_tags:
             if seed not in name_to_idx:
                 continue
-            seed_count = float(self.df.iloc[name_to_idx[seed]].get('post_count', 1) or 1)
+            seed_count = float(arr_post_count[name_to_idx[seed]] or 1)
 
             for neighbor, cnt in self.cooc.get(seed, []):
                 if neighbor in exclude or neighbor == seed:
@@ -509,9 +776,7 @@ class DanbooruTagger:
                 if neighbor not in name_to_idx:
                     continue
 
-                neighbor_count = float(
-                    self.df.iloc[name_to_idx[neighbor]].get('post_count', 1) or 1
-                )
+                neighbor_count = float(arr_post_count[name_to_idx[neighbor]] or 1)
                 cooc = min(float(cnt), seed_count, neighbor_count)
                 if cooc <= 0:
                     continue
@@ -538,21 +803,24 @@ class DanbooruTagger:
         for tag_name, raw_score in sorted_candidates:
             if len(results) >= limit:
                 break
-            row  = self.df.iloc[name_to_idx[tag_name]]
-            nsfw = str(row.get('nsfw', '0'))
+            idx = name_to_idx[tag_name]
+            nsfw = self._arr_nsfw[idx]
             if nsfw == '1' and not show_nsfw:
                 continue
-            cat = CAT_MAP.get(str(row.get('category', '0')), 'Other')
+            cat = CAT_MAP.get(self._arr_category[idx], 'Other')
             results.append(RelatedTag(
                 tag=tag_name,
-                cn_name=str(row.get('cn_name', '')),
+                cn_name=str(self._arr_cn_name[idx]),
                 category=cat,
                 nsfw=nsfw,
-                cooc_count=total_cooc[tag_name],
+                cooc_count=total_cooc.get(tag_name, 0),
                 cooc_score=round(raw_score / max_score, 4),
                 sources=tag_sources.get(tag_name, []),
+                post_count=int(self._arr_post_count[idx]),
+                wiki=str(self._arr_wiki[idx]) if self._arr_wiki is not None else '',
             ))
 
+        self._related_cache.put(related_key, results)
         return results
 
     def _load_cooc(self) -> None:

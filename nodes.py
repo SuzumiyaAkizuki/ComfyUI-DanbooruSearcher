@@ -117,6 +117,10 @@ class DanbooruTagSearch:
             lines.append(f"segmentation keywords: {', '.join(response.keywords)}")
             lines.append("")
 
+        if response.segments:
+            lines.append(f"sentence segments: {', '.join(response.segments)}")
+            lines.append("")
+
         lines += [
             f"{'tag':<28} {'score':<7} {'sem':<7} {'source':<12} cn_name",
             "-" * 80,
@@ -161,8 +165,8 @@ class DanbooruRelated:
             }
         }
 
-    RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("related_tags", "combined_tags")
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("related_tags", "combined_tags", "debug_info")
     FUNCTION = "related"
     CATEGORY = "utils/prompt"
 
@@ -200,4 +204,29 @@ class DanbooruRelated:
                 seen.add(tag)
                 combined_list.append(tag)
 
-        return (related_str, ", ".join(combined_list))
+        # ── debug_info ──────────────────────────────────────────────────
+        debug_lines = []
+
+        if seed_tags:
+            debug_lines.append(f"seed tags (per source):")
+            for r in seeds.values():
+                debug_lines.append(f"  [{r.source}] {r.tag} (score={r.final_score:.3f})")
+            debug_lines.append("")
+
+        if related:
+            debug_lines += [
+                f"{'tag':<28} {'npmi':<7} {'cooc':<7} {'src':<12} {'post':<8} cn_name",
+                "-" * 95,
+            ]
+            for r in related:
+                src_short = ', '.join(r.sources[:2])
+                if len(r.sources) > 2:
+                    src_short += f', +{len(r.sources)-2}'
+                debug_lines.append(
+                    f"{r.tag:<28} {r.cooc_score:<7.4f} {r.cooc_count:<7} "
+                    f"{src_short[:20]:<12} {r.post_count:<8} {r.cn_name}"
+                )
+        else:
+            debug_lines.append("(no related tags found)")
+
+        return (related_str, ", ".join(combined_list), "\n".join(debug_lines))
